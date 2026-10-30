@@ -75,6 +75,7 @@
     position: absolute; right: 0; top: calc(100% + 6px); z-index: 20; width: 380px; max-width: 90vw;
     background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 12px;
     box-shadow: 0 8px 24px rgba(29,39,72,.18); font-size: .88rem; color: var(--ink);
+    max-height: calc(100vh - 110px); overflow: auto;
   }
   .adv-body p { margin: 0 0 8px; }
   .adv-body ul { margin: 6px 0 0; padding-left: 18px; }
@@ -101,7 +102,7 @@
 
   .tracks { flex: 1 1 0; min-height: 470px; display: flex; flex-direction: column; gap: 8px; }
   .stepbar, .track { display: grid; grid-template-columns: var(--panel-w) minmax(0, 1fr); gap: 8px; }
-  .steps, .grid { display: grid; grid-template-columns: 50px repeat(16, minmax(0, 1fr)); gap: 3px; }
+  .steps, .grid { display: grid; grid-template-columns: 58px repeat(16, minmax(0, 1fr)); gap: 3px; }
   .steps { height: 18px; }
   .stephead { text-align: center; font-size: .7rem; line-height: 18px; color: var(--muted); border-radius: 5px; }
   .stephead.beat { font-weight: 800; color: var(--ink); }
@@ -126,6 +127,13 @@
     font-weight: 800; font-size: .72rem;
     border-radius: 6px; background: var(--off); border-left: 5px solid var(--on);
   }
+  .rowlabel select.drumsel {
+    width: 100%; height: 100%; min-height: 0; padding: 0 0 0 3px; border: 0; border-radius: 6px;
+    background: transparent; color: var(--ink); font: inherit; font-size: .68rem; font-weight: 800; cursor: pointer;
+  }
+  .drumtable { display: grid; grid-template-columns: auto 74px auto; gap: 4px 10px; align-items: center; margin-top: 8px; }
+  .drumtable span { font-weight: 800; font-size: .82rem; }
+  .row-inline { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   .cell {
     padding: 0; border: 0; border-radius: 6px; background: var(--off);
     cursor: pointer; touch-action: none;
@@ -162,8 +170,16 @@
           <li><strong>Song:</strong> every change is saved to the selected sequence automatically. <em>+ New</em> adds a blank sequence, <em>Copy</em> makes a duplicate you can tweak, and the arrows move it. <em>Play song</em> plays the sequences in order, then starts over. Click a sequence while it plays to jump to it at the next bar.</li>
           <li>Click or drag across squares to paint steps. Space bar plays and stops. Arrow keys move around the grid and Enter toggles a step.</li>
         </ul>
-        <p style="margin-top:10px"><strong>Bluetooth (experimental)</strong></p>
-        <div class="row-inline" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <p style="margin-top:10px"><strong>Drum kit notes</strong></p>
+        <p>Each drum plays one MIDI note. Only the ones marked &#10003; were checked on the FM-1; the rest are best guesses. <em>Scan</em> plays notes 36&ndash;59 one at a time so you can hear which is which, then fix any number below. Pick which drum sits on each row with the little menus beside the drum rows.</p>
+        <div class="row-inline">
+          <button id="scanBtn" class="mini" type="button">Scan notes 36&ndash;59</button>
+          <button id="resetDrums" class="mini" type="button">Reset notes</button>
+          <span id="scanOut" class="monitor"></span>
+        </div>
+        <div id="drumTable" class="drumtable"></div>
+        <p style="margin-top:12px"><strong>Bluetooth (experimental)</strong></p>
+        <div class="row-inline">
           <button id="connectBle" class="mini" type="button">Connect Bluetooth MIDI</button>
           <label class="check" for="bleAll"><input id="bleAll" type="checkbox"> Show all nearby devices</label>
         </div>
@@ -214,13 +230,31 @@
   const TICK = 25;         // ms between scheduler wake-ups
   const STORE_KEY = 'bandseq.v1';
 
-  // Drum notes on the FM-1's 808 kit, bottom row to top row. Edit to taste.
-  const DRUM_NOTES  = [36, 38, 39, 44];            // C2 D2 D#2 G#2
-  const DRUM_LABELS = ['KICK', 'SNARE', 'CLAP', 'HAT'];
-  const DRUM_HUES   = [0, 42, 300, 190];
+  // The 808 drum sounds. Notes marked verified were checked on the FM-1; the others are
+  // General MIDI-style guesses. Fix them with the Drum kit notes panel (under More).
+  const DRUM_SOUNDS = [
+    { id: 'kick',  label: 'KICK',  note: 36, hue: 0,   verified: true },
+    { id: 'snare', label: 'SNARE', note: 38, hue: 42,  verified: true },
+    { id: 'clap',  label: 'CLAP',  note: 39, hue: 300, verified: true },
+    { id: 'hatC',  label: 'HAT C', note: 44, hue: 190, verified: true },
+    { id: 'hatO',  label: 'HAT O', note: 46, hue: 165 },
+    { id: 'rim',   label: 'RIM',   note: 37, hue: 25 },
+    { id: 'tomL',  label: 'TOM L', note: 41, hue: 270 },
+    { id: 'tomM',  label: 'TOM M', note: 45, hue: 245 },
+    { id: 'tomH',  label: 'TOM H', note: 50, hue: 215 },
+    { id: 'crash', label: 'CRASH', note: 49, hue: 130 },
+    { id: 'bell',  label: 'BELL',  note: 56, hue: 55 }
+  ];
+  const DRUM_BY_ID = {};
+  DRUM_SOUNDS.forEach(d => { DRUM_BY_ID[d.id] = d; });
+  const DRUM_ROWS = 6;                                                  // rows in the drum grid
+  const DRUM_ROW_DEFAULT = ['kick', 'snare', 'clap', 'hatC', 'hatO', 'tomM'];   // bottom to top
+  const drumRow = DRUM_ROW_DEFAULT.slice();       // which sound each drum row plays
+  const drumNotes = {};                           // note overrides by sound id
+  const drumNote = id => (drumNotes[id] !== undefined ? drumNotes[id] : DRUM_BY_ID[id].note);
 
   const TRACK_DEFS = [
-    { id: 'drums', name: 'Drums', drums: true,  rows: 4, ch: 2, oct: 0, vel: 110, gate: 30, hue: 0 },
+    { id: 'drums', name: 'Drums', drums: true,  rows: DRUM_ROWS, ch: 2, oct: 0, vel: 110, gate: 30, hue: 0 },
     { id: 'bass',  name: 'Bass',  drums: false, rows: 8, ch: 1, oct: 2, vel: 105, gate: 70, hue: 235 },
     { id: 'lead',  name: 'Lead',  drums: false, rows: 8, ch: 3, oct: 4, vel: 95,  gate: 70, hue: 130 }
   ];
@@ -258,6 +292,7 @@
     sounding: new Set(),      // MIDI notes we have turned on and not yet off
     cells: [],                // cells[row][step] -> element
     labels: [],
+    drumSels: [],
     els: {}
   }));
 
@@ -271,6 +306,13 @@
         if (v.octave >= 0 && v.octave <= 8) tracks[i].octave = v.octave;
         if (v.velocity >= 30 && v.velocity <= 127) tracks[i].velocity = v.velocity;
       });
+      if (Array.isArray(s.drumRow)) s.drumRow.slice(0, DRUM_ROWS).forEach((id, r) => { if (DRUM_BY_ID[id]) drumRow[r] = id; });
+      if (s.drumNotes && typeof s.drumNotes === 'object') {
+        Object.keys(s.drumNotes).forEach(id => {
+          const v = Number(s.drumNotes[id]);
+          if (DRUM_BY_ID[id] && v >= 0 && v <= 127) drumNotes[id] = Math.round(v);
+        });
+      }
       if (s.bpm >= 60 && s.bpm <= 180) tempo.value = s.bpm;
       if (s.scale && SCALES[s.scale]) scaleSel.value = s.scale;
       if (s.key >= 0 && s.key <= 11) keySel.value = s.key;
@@ -280,7 +322,8 @@
     try {
       localStorage.setItem(STORE_KEY, JSON.stringify({
         tracks: tracks.map(t => ({ channel: t.channel, octave: t.octave, velocity: t.velocity })),
-        bpm: Number(tempo.value), scale: scaleSel.value, key: Number(keySel.value)
+        bpm: Number(tempo.value), scale: scaleSel.value, key: Number(keySel.value),
+        drumRow, drumNotes
       }));
     } catch (e) { /* ignore */ }
   }
@@ -290,7 +333,7 @@
 
   function rowNote(ti, r) {
     const tr = tracks[ti];
-    if (tr.def.drums) return DRUM_NOTES[r];
+    if (tr.def.drums) return drumNote(drumRow[r]);
     const sc = SCALES[scaleSel.value];
     const root = 12 * (tr.octave + 1) + Number(keySel.value);
     return root + 12 * Math.floor(r / sc.length) + sc[r % sc.length];
@@ -309,11 +352,14 @@
     tracks.forEach((tr, ti) => {
       for (let r = 0; r < tr.def.rows; r++) {
         const n = rowNote(ti, r);
-        const hue = tr.def.drums ? DRUM_HUES[r] : PC_HUES[n % 12];
+        const snd = tr.def.drums ? DRUM_BY_ID[drumRow[r]] : null;
+        const hue = snd ? snd.hue : PC_HUES[n % 12];
+        const text = snd ? snd.label : noteName(n);
         setRowColors([tr.labels[r], ...tr.cells[r]], hue);
-        tr.labels[r].textContent = tr.def.drums ? DRUM_LABELS[r] : noteName(n);
+        if (snd) tr.drumSels[r].value = drumRow[r];
+        else tr.labels[r].textContent = text;
         for (let s = 0; s < STEPS; s++) {
-          tr.cells[r][s].setAttribute('aria-label', `${tr.def.name} ${tr.def.drums ? DRUM_LABELS[r] : noteName(n)}, step ${s + 1}`);
+          tr.cells[r][s].setAttribute('aria-label', `${tr.def.name} ${text}, step ${s + 1}`);
         }
       }
       if (!tr.def.drums) tr.els.oct.textContent = 'Oct ' + tr.octave;
@@ -442,6 +488,22 @@
       const lab = document.createElement('div');
       lab.className = 'rowlabel';
       tr.labels[r] = lab;
+      if (def.drums) {
+        const dsel = document.createElement('select');
+        dsel.className = 'drumsel';
+        dsel.setAttribute('aria-label', `Drum row ${r + 1} sound`);
+        DRUM_SOUNDS.forEach(d => dsel.add(new Option(d.label, d.id)));
+        dsel.value = drumRow[r];
+        dsel.addEventListener('change', () => {
+          drumRow[r] = dsel.value;
+          updateRows();
+          saveSettings();
+          ensureAudio();
+          playNote(ti, r, performance.now() + 5, 220);       // hear the new sound
+        });
+        lab.appendChild(dsel);
+        tr.drumSels[r] = dsel;
+      }
       grid.appendChild(lab);
       tr.cells[r] = [];
       for (let s = 0; s < STEPS; s++) {
@@ -483,15 +545,39 @@
     const tr = tracks[ti];
     for (let r = 0; r < tr.def.rows; r++) for (let s = 0; s < STEPS; s++) setCell(ti, r, s, false);
   }
+  // Drum "Surprise me" follows musical roles instead of filling rows blindly, so extra
+  // sounds (toms, crash, cowbell...) show up sparingly where they make sense.
+  function randomDrums(ti) {
+    const grid = tracks[ti].grid;
+    const rand = Math.random;
+    const pick = arr => arr[Math.floor(rand() * arr.length)];
+    const put = (r, s) => setCell(ti, r, s, true);
+    const rowsOf = id => { const out = []; drumRow.forEach((x, r) => { if (x === id) out.push(r); }); return out; };
+    const offbeats = [2, 3, 6, 7, 10, 11, 14, 15];
+
+    rowsOf('kick').forEach(r => { put(r, 0); put(r, 8); if (rand() < 0.6) put(r, pick([3, 6, 7, 10, 11, 14])); });
+    rowsOf('snare').forEach(r => { put(r, 4); put(r, 12); if (rand() < 0.25) put(r, pick([7, 15])); });
+    rowsOf('clap').forEach(r => { if (rand() < 0.6) { put(r, 4); put(r, 12); } else if (rand() < 0.5) put(r, 12); });
+    rowsOf('rim').forEach(r => offbeats.forEach(s => { if (rand() < 0.15) put(r, s); }));
+    rowsOf('hatO').forEach(r => [2, 6, 10, 14].forEach(s => { if (rand() < 0.35) put(r, s); }));
+    rowsOf('hatC').forEach(r => {
+      for (let s = 0; s < STEPS; s += 2) {
+        const openHere = rowsOf('hatO').some(o => grid[o][s]);
+        if (!openHere && rand() < 0.8) put(r, s);        // closed hat steps aside for an open hat
+      }
+      if (rand() < 0.3) put(r, pick([1, 5, 9, 13]));
+    });
+    const toms = [...rowsOf('tomL'), ...rowsOf('tomM'), ...rowsOf('tomH')];
+    if (toms.length && rand() < 0.6) [12, 13, 14, 15].forEach(s => { if (rand() < 0.55) put(pick(toms), s); });   // a short fill
+    rowsOf('crash').forEach(r => { if (rand() < 0.4) put(r, 0); });
+    rowsOf('bell').forEach(r => offbeats.forEach(s => { if (rand() < 0.1) put(r, s); }));
+  }
+
   function randomize(ti) {
     const tr = tracks[ti];
     clearTrack(ti);
     if (tr.def.drums) {
-      setCell(ti, 0, 0, true); setCell(ti, 0, 8, true);
-      setCell(ti, 1, 4, true); setCell(ti, 1, 12, true);
-      for (let s = 0; s < STEPS; s += 2) if (Math.random() < 0.7) setCell(ti, 3, s, true);
-      if (Math.random() < 0.5) setCell(ti, 2, Math.floor(Math.random() * STEPS), true);
-      if (Math.random() < 0.5) setCell(ti, 0, Math.floor(Math.random() * STEPS), true);
+      randomDrums(ti);
     } else {
       for (let s = 0; s < STEPS; s++) {
         if (Math.random() < 0.5) setCell(ti, Math.floor(Math.random() * tr.def.rows), s, true);
@@ -515,7 +601,7 @@
     const avail = tracksEl.clientHeight;
     const totalRows = tracks.reduce((a, t) => a + t.def.rows, 0);
     const gaps = 3 * (totalRows - tracks.length) + 8 * tracks.length + 18;
-    const h = Math.max(18, Math.min(40, Math.floor((avail - gaps) / totalRows)));
+    const h = Math.max(16, Math.min(40, Math.floor((avail - gaps) / totalRows)));
     tracksEl.style.setProperty('--cell-h', h + 'px');
   }
   if (window.ResizeObserver) new ResizeObserver(fit).observe(tracksEl);
@@ -550,35 +636,40 @@
     src.stop(t + dur + 0.02);
   }
 
+  function synthDrum(id, ctx, t, level) {
+    const noise = (dur, type, freq, peak, delay) => noiseHit(ctx, t + (delay || 0), dur, type, freq, peak * level);
+    const tone = (type, f0, f1, dur, peak) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(f0, t);
+      if (f1 !== f0) o.frequency.exponentialRampToValueAtTime(f1, t + dur * 0.6);
+      g.gain.setValueAtTime(peak * level, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+      o.connect(g).connect(ctx.destination);
+      o.start(t); o.stop(t + dur + 0.02);
+    };
+    switch (id) {
+      case 'kick':  tone('sine', 150, 45, 0.3, 0.9); break;
+      case 'snare': noise(0.16, 'highpass', 1200, 0.5); tone('triangle', 190, 190, 0.1, 0.4); break;
+      case 'clap':  noise(0.04, 'bandpass', 1500, 0.5); noise(0.04, 'bandpass', 1500, 0.5, 0.015); noise(0.14, 'bandpass', 1500, 0.5, 0.03); break;
+      case 'rim':   tone('square', 1700, 1700, 0.03, 0.25); noise(0.03, 'highpass', 3000, 0.3); break;
+      case 'tomL':  tone('sine', 130, 80, 0.35, 0.7); break;
+      case 'tomM':  tone('sine', 180, 110, 0.3, 0.7); break;
+      case 'tomH':  tone('sine', 250, 150, 0.25, 0.7); break;
+      case 'hatO':  noise(0.35, 'highpass', 7000, 0.3); break;
+      case 'crash': noise(0.9, 'highpass', 5000, 0.3); break;
+      case 'bell':  tone('square', 560, 560, 0.2, 0.18); tone('square', 845, 845, 0.2, 0.18); break;
+      default:      noise(0.05, 'highpass', 7000, 0.35);          // closed hat
+    }
+  }
+
   function synth(ti, r, n, vel, tMs, lenMs) {
     const ctx = ensureAudio();
     if (!ctx) return;
     const t = ctx.currentTime + Math.max(0, tMs - performance.now()) / 1000;
     const level = vel / 127;
     if (tracks[ti].def.drums) {
-      if (r === 0) {                        // kick
-        const o = ctx.createOscillator(), g = ctx.createGain();
-        o.frequency.setValueAtTime(150, t);
-        o.frequency.exponentialRampToValueAtTime(45, t + 0.12);
-        g.gain.setValueAtTime(0.9 * level, t);
-        g.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
-        o.connect(g).connect(ctx.destination);
-        o.start(t); o.stop(t + 0.32);
-      } else if (r === 1) {                 // snare
-        noiseHit(ctx, t, 0.16, 'highpass', 1200, 0.5 * level);
-        const o = ctx.createOscillator(), g = ctx.createGain();
-        o.type = 'triangle'; o.frequency.value = 190;
-        g.gain.setValueAtTime(0.4 * level, t);
-        g.gain.exponentialRampToValueAtTime(0.001, t + 0.1);
-        o.connect(g).connect(ctx.destination);
-        o.start(t); o.stop(t + 0.12);
-      } else if (r === 2) {                 // clap
-        noiseHit(ctx, t, 0.04, 'bandpass', 1500, 0.5 * level);
-        noiseHit(ctx, t + 0.015, 0.04, 'bandpass', 1500, 0.5 * level);
-        noiseHit(ctx, t + 0.03, 0.14, 'bandpass', 1500, 0.5 * level);
-      } else {                              // hat
-        noiseHit(ctx, t, 0.05, 'highpass', 7000, 0.35 * level);
-      }
+      synthDrum(drumRow[r], ctx, t, level);
       return;
     }
     const dur = Math.max(0.03, lenMs / 1000);
@@ -989,6 +1080,83 @@
     if (bleOut) { try { bleOut.dev.gatt.disconnect(); } catch (e) {} }
   });
 
+
+
+  // ===================== Drum kit notes panel =====================
+  const drumTable = $('drumTable'), scanBtn = $('scanBtn'), scanOut = $('scanOut');
+
+  function auditionSound(id) {
+    const tr = tracks[0];
+    const n = drumNote(id), ch = tr.channel - 1;
+    if (currentOut) {
+      sendMidi([0x90 | ch, n, tr.velocity], 0);
+      setTimeout(() => sendMidi([0x80 | ch, n, 0], 0), 300);
+    }
+    if (builtinOn()) {
+      const ctx = ensureAudio();
+      if (ctx) synthDrum(id, ctx, ctx.currentTime, tr.velocity / 127);
+    }
+    monitor(`Note On  ch ${String(ch + 1).padStart(2)}  ${noteName(n).padEnd(3)} (${String(n).padStart(3)})  ${DRUM_BY_ID[id].label}`);
+  }
+
+  function buildDrumTable() {
+    drumTable.innerHTML = '';
+    DRUM_SOUNDS.forEach(d => {
+      const name = document.createElement('span');
+      name.textContent = d.label + (d.verified ? ' \u2713' : '');
+      name.title = d.verified ? 'Checked on the FM-1' : 'Not checked yet';
+      const inp = document.createElement('input');
+      inp.type = 'number'; inp.min = 0; inp.max = 127; inp.value = drumNote(d.id);
+      inp.setAttribute('aria-label', d.label + ' MIDI note');
+      inp.addEventListener('change', () => {
+        const v = Math.round(Number(inp.value));
+        if (v >= 0 && v <= 127) { drumNotes[d.id] = v; saveSettings(); }
+        inp.value = drumNote(d.id);
+      });
+      const play = document.createElement('button');
+      play.type = 'button'; play.className = 'mini'; play.textContent = '\u25B6';
+      play.setAttribute('aria-label', 'Hear ' + d.label);
+      play.addEventListener('click', () => auditionSound(d.id));
+      drumTable.append(name, inp, play);
+    });
+  }
+
+  // Scan: plays notes 36-59 on the drum channel, one at a time, so you can hear what each one is
+  let scanTimer = null, scanNote = 36;
+  function stopScan() {
+    clearTimeout(scanTimer);
+    scanTimer = null;
+    scanBtn.textContent = 'Scan notes 36\u201359';
+    scanOut.textContent = '';
+    releaseTrack(0);
+  }
+  function scanStep() {
+    if (scanNote > 59) { stopScan(); return; }
+    const ch = tracks[0].channel - 1, n = scanNote;
+    sendMidi([0x90 | ch, n, 110], 0);
+    tracks[0].sounding.add(n);
+    const text = `Note ${n}  (${noteName(n)})`;
+    scanOut.textContent = text;
+    monitor('Scan: ' + text);
+    setTimeout(() => sendMidi([0x80 | ch, n, 0], 0), 380);
+    scanNote++;
+    scanTimer = setTimeout(scanStep, 850);
+  }
+  scanBtn.addEventListener('click', () => {
+    if (scanTimer) { stopScan(); return; }
+    if (!currentOut) { setStatus('Connect the FM-1 first, then scan.', 'bad'); return; }
+    if (playing) stop();
+    scanNote = 36;
+    scanBtn.textContent = 'Stop scan';
+    scanStep();
+  });
+  $('resetDrums').addEventListener('click', () => {
+    Object.keys(drumNotes).forEach(k => delete drumNotes[k]);
+    buildDrumTable();
+    updateRows();
+    saveSettings();
+  });
+  buildDrumTable();
 
   // ===================== Sequences and song =====================
   // Every sequence holds a grid for each track. The song is the list of sequences in play order.
